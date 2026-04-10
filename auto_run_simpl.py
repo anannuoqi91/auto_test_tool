@@ -44,7 +44,7 @@ GNOME_SCREEN_RECORD_AUTO_UNLIMITED = os.environ.get(
 }
 VIDEO_FILE_SUFFIXES = (".webm", ".mkv", ".mp4")
 SCREEN_RECORD_TARGET_FORMAT = os.environ.get(
-    "SCREEN_RECORD_TARGET_FORMAT", "mp4").strip().lower()
+    "SCREEN_RECORD_TARGET_FORMAT", "webm").strip().lower()
 
 
 @dataclass

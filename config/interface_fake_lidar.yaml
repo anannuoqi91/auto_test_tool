@@ -1,0 +1,56 @@
+# Start Single Lidar Replay
+fakelidar_single_start:
+  ext_url: "/v2/play/start"
+  model: POST
+  parameters: null
+  description: "Start the replay of a single LiDAR point cloud."
+
+# Stop Single Lidar Replay
+fakelidar_single_stop:
+  ext_url: "/v2/play/stop"
+  model: GET
+  parameters: null
+  description: "Stop the ongoing LiDAR point cloud replay for a single LiDAR."
+
+# Start Synchronized Multiple Lidar Replay
+fakelidar_multiple_start:
+  ext_url: "/v2/play/sync_start"
+  model: POST
+  parameters: null
+  description: "Start the synchronized replay of multiple LiDAR point clouds."
+
+# Stop Synchronized Multiple Lidar Replay
+fakelidar_multiple_stop:
+  ext_url: "/v2/play/sync_stop"
+  model: GET
+  parameters: null
+  description: "Stop the synchronized replay of multiple LiDAR point clouds."
+
+# Get Point Cloud File Information
+fakelidar_getinfo:
+  ext_url: "/v2/other/inno_pc_info"
+  model: GET
+  parameters:
+    path: null
+  description: "Get detailed information about a specific point cloud file."
+
+# Get Available Files List
+fakelidar_get_files:
+  ext_url: "/v2/other/files"
+  model: GET
+  parameters:
+    path: null
+  description: "Retrieve a list of available point cloud files stored in the system."
+
+fakelidar_upload_inno_pc_client:
+  ext_url: "/v2/settings/tools/upload"
+  model: POST
+  parameters: null
+  description: "Upload an InnoPC client file to the system for processing or integration."
+
+fakelidar_get_inno_pc_info:
+  ext_url: "/v2/other/inno_pc_info"
+  model: GET
+  parameters:
+    inno_pc_path: null
+  description: "Retrieve detailed information about a specific InnoPC file."

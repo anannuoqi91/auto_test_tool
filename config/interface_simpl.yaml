@@ -1,0 +1,10 @@
+# Update Lidar Channel Configuration
+simpl_channel_config:
+  ext_url: "/prod-api/lidar/channelConfig"
+  model: PUT
+  parameters: null
+  payload:
+    id: 1
+    busId: 1
+    channelName: "omnisense/track/01/dynamic_points&omnisense/track/01/static_points&omnisense/cluster/01/boxes"
+  description: "Update lidar channel configuration for the target bus."

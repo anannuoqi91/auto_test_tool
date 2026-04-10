@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Set, List, Optional, Tuple
+from typing import Set, List, Optional, Tuple, Dict
 from play_single_lidar import *
 from set_simpl import *
 
@@ -495,9 +495,9 @@ def _get_gnome_recording_candidate_dirs() -> Tuple[Path, ...]:
 
 
 def _list_recording_candidates_in_dirs(
-    candidate_dirs: tuple[Path, ...],
-) -> list[Path]:
-    files_by_path: dict[str, Path] = {}
+    candidate_dirs: Tuple[Path, ...],
+) -> List[Path]:
+    files_by_path: Dict[str, Path] = {}
     for candidate_dir in candidate_dirs:
         if not candidate_dir.exists() or not candidate_dir.is_dir():
             continue

@@ -74,6 +74,7 @@ LIDAR_{id}_{timestamp}.inno_pc
 python3 auto_run_simpl.py \
   --sim_ip 172.16.210.98 \
   --lidar_ids 11,10 \
+  --fake_lidar_ip 172.30.0.2 \
   --items tracker,cluster,event \
   --out_dir ./output
 ```
@@ -91,6 +92,7 @@ python3 auto_run_simpl.py \
 python3 auto_run_simpl.py \
   --sim_ip 172.16.210.98 \
   --lidar_ids 11 \
+  --fake_lidar_ip 172.30.0.2 \
   --items tracker \
   --out_dir ./output
 ```
@@ -101,6 +103,7 @@ python3 auto_run_simpl.py \
 python3 auto_run_simpl.py \
   --sim_ip 172.16.210.98 \
   --lidar_ids 11,10 \
+  --fake_lidar_ip 172.30.0.2 \
   --items tracker \
   --keywords korail,rain \
   --out_dir ./output
@@ -112,6 +115,7 @@ python3 auto_run_simpl.py \
 python3 auto_run_simpl.py \
   --sim_ip 172.16.210.98 \
   --lidar_ids 11,10,21,31 \
+  --fake_lidar_ip 172.30.0.2 \
   --items tracker \
   --out_dir ./output \
   --dry_run \

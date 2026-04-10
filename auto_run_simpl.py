@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Set, List, Optional, Tuple, Dict
+from typing import Set, List, Optional, Tuple, Dict, Set
 from play_single_lidar import *
 from set_simpl import *
 
@@ -22,6 +22,14 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+os.makedirs(f'./log', exist_ok=True)
+log_path = f'./log/auto_run_simpl.log'
+file_handler = logging.FileHandler(log_path, encoding="utf-8")
+file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(levelname)-7s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+logging.getLogger().addHandler(file_handler)
 
 CONF_FILE = Path(__file__).resolve().parent / \
     "config" / "interface_fake_lidar.yaml"
@@ -44,7 +52,16 @@ GNOME_SCREEN_RECORD_AUTO_UNLIMITED = os.environ.get(
 }
 VIDEO_FILE_SUFFIXES = (".webm", ".mkv", ".mp4")
 SCREEN_RECORD_TARGET_FORMAT = os.environ.get(
-    "SCREEN_RECORD_TARGET_FORMAT", "webm").strip().lower()
+    "SCREEN_RECORD_TARGET_FORMAT", "mp4").strip().lower()
+SCREEN_RECORD_START_TIMEOUT = float(
+    os.environ.get("SCREEN_RECORD_START_TIMEOUT", "10")
+)
+SCREEN_RECORD_POLL_INTERVAL = float(
+    os.environ.get("SCREEN_RECORD_POLL_INTERVAL", "0.5")
+)
+SCREEN_RECORD_STABLE_ROUNDS = int(
+    os.environ.get("SCREEN_RECORD_STABLE_ROUNDS", "3")
+)
 
 
 @dataclass
@@ -58,6 +75,7 @@ class ScreenRecordingSession:
     candidate_dirs: Tuple[Path, ...] = field(default_factory=tuple)
     gnome_shortcut: Optional[str] = None
     restore_max_length: Optional[int] = None
+    record_file: Optional[Path] = None
 
 
 def _build_args() -> argparse.Namespace:
@@ -378,7 +396,7 @@ def _gsettings_set(schema: str, key: str, value: str) -> None:
         )
 
 
-def _parse_gnome_shortcut(binding: str) -> str | None:
+def _parse_gnome_shortcut(binding: str):
     tokens = re.findall(r"<([^>]+)>", binding)
     key = re.sub(r"(?:<[^>]+>)", "", binding).strip()
     if not key:
@@ -433,7 +451,7 @@ def _get_gnome_screencast_shortcut() -> str:
     return GNOME_DEFAULT_SCREENCAST_SHORTCUT
 
 
-def _get_gnome_max_screencast_length() -> int | None:
+def _get_gnome_max_screencast_length():
     raw_value = _gsettings_get(
         GNOME_MEDIA_KEYS_SCHEMA, GNOME_MAX_SCREENCAST_LENGTH_KEY)
     if not raw_value:
@@ -525,6 +543,12 @@ def ensure_screen_recording_ready(backend: str) -> None:
         output_template = get_ssr_output_template()
         logger.info("Screen recording output template: %s", output_template)
         return
+
+    logger.warning(
+        "gnome-shortcut backend is toggle-based and cannot strictly guarantee "
+        "that the exported video matches the interval between start_screen_recording() "
+        "and stop_screen_recording(). Recommend using --screen_record_backend ssr."
+    )
 
     if shutil.which("xdotool") is None:
         raise RuntimeError(
@@ -708,7 +732,7 @@ def start_screen_recording(backend: str) -> ScreenRecordingSession:
                 except RuntimeError as exc:
                     logger.warning("%s", exc)
             raise
-        logger.info("Screen recording started.")
+        logger.info("Screen recording started (GNOME toggle backend).")
         return ScreenRecordingSession(
             backend=backend,
             known_files=known_files,
@@ -739,23 +763,43 @@ def start_screen_recording(backend: str) -> ScreenRecordingSession:
         _send_ssr_key(window_id, "Return")
         time.sleep(0.5)
 
+    started_at = time.time()
     _send_ssr_key(window_id, "Return")
-    logger.info("Screen recording started.")
+
+    record_file = _wait_for_active_recording_file(
+        known_files=known_files,
+        started_at=started_at,
+        list_candidates_fn=lambda: _list_recording_candidates(output_template),
+    )
+    if record_file is None:
+        _close_screen_recording_app(
+            ScreenRecordingSession(
+                backend=backend,
+                process=process,
+                window_id=window_id,
+            )
+        )
+        raise RuntimeError(
+            "SSR start action was sent, but no actively growing recording file was detected."
+        )
+
+    logger.info("Screen recording started: %s", record_file)
     return ScreenRecordingSession(
         backend=backend,
         process=process,
         window_id=window_id,
         output_template=output_template,
         known_files=known_files,
-        started_at=time.time(),
+        started_at=started_at,
+        record_file=record_file,
     )
 
 
 def _find_recent_recorded_file(
-    known_files: set[str],
+    known_files: Set[str],
     started_at: float,
     list_candidates_fn,
-) -> Path | None:
+):
     deadline = time.time() + SSR_FILE_WAIT_SECONDS
     fallback_candidate: Path | None = None
     while time.time() < deadline:
@@ -778,7 +822,7 @@ def _find_recent_recorded_file(
     return fallback_candidate
 
 
-def _find_recorded_file(session: ScreenRecordingSession) -> Path | None:
+def _find_recorded_file(session: ScreenRecordingSession):
     if session.backend == "gnome-shortcut":
         return _find_recent_recorded_file(
             session.known_files,
@@ -796,6 +840,78 @@ def _find_recorded_file(session: ScreenRecordingSession) -> Path | None:
     )
 
 
+def _wait_for_active_recording_file(
+    known_files: Set[str],
+    started_at: float,
+    list_candidates_fn,
+    timeout: float = SCREEN_RECORD_START_TIMEOUT,
+):
+    deadline = time.time() + timeout
+    last_sizes: Dict[str, int] = {}
+
+    while time.time() < deadline:
+        candidates = list_candidates_fn()
+        for path in reversed(candidates):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+
+            if stat.st_mtime < started_at - 0.2:
+                continue
+
+            key = str(path)
+            current_size = stat.st_size
+            prev_size = last_sizes.get(key)
+
+            if current_size > 0 and prev_size is not None and current_size > prev_size:
+                return path
+
+            last_sizes[key] = current_size
+
+        time.sleep(SCREEN_RECORD_POLL_INTERVAL)
+
+    return None
+
+
+def _wait_for_record_file_stable(
+    record_file: Optional[Path] = None,
+    timeout: float = SSR_FILE_WAIT_SECONDS,
+    stable_rounds: int = SCREEN_RECORD_STABLE_ROUNDS,
+):
+    if record_file is None:
+        return None
+
+    deadline = time.time() + timeout
+    last_size = None
+    stable_count = 0
+
+    while time.time() < deadline:
+        if not record_file.exists():
+            time.sleep(SCREEN_RECORD_POLL_INTERVAL)
+            continue
+
+        try:
+            current_size = record_file.stat().st_size
+        except FileNotFoundError:
+            time.sleep(SCREEN_RECORD_POLL_INTERVAL)
+            continue
+
+        if current_size <= 0:
+            stable_count = 0
+        elif last_size is not None and current_size == last_size:
+            stable_count += 1
+            if stable_count >= stable_rounds:
+                return record_file
+        else:
+            stable_count = 0
+
+        last_size = current_size
+        time.sleep(SCREEN_RECORD_POLL_INTERVAL)
+
+    return record_file if record_file.exists() else None
+
+
 def _close_screen_recording_app(session: ScreenRecordingSession) -> None:
     if session.process is None or session.window_id is None:
         return
@@ -810,7 +926,7 @@ def _close_screen_recording_app(session: ScreenRecordingSession) -> None:
             "SimpleScreenRecorder did not exit within 5s after save.")
 
 
-def stop_screen_recording(session: ScreenRecordingSession) -> Path | None:
+def stop_screen_recording(session: ScreenRecordingSession):
     if session.backend == "gnome-shortcut":
         if not session.gnome_shortcut:
             raise RuntimeError(
@@ -821,6 +937,7 @@ def stop_screen_recording(session: ScreenRecordingSession) -> Path | None:
             _toggle_gnome_screen_recording(session.gnome_shortcut)
             time.sleep(1.0)
             record_file = _find_recorded_file(session)
+            record_file = _wait_for_record_file_stable(record_file)
         finally:
             if session.restore_max_length is not None:
                 try:
@@ -842,13 +959,18 @@ def stop_screen_recording(session: ScreenRecordingSession) -> Path | None:
 
     if session.window_id is None:
         raise RuntimeError("SSR recording session does not have a window ID.")
+
     _activate_ssr_window(session.window_id)
     for _ in range(SSR_SAVE_TAB_COUNT):
         _send_ssr_key(session.window_id, "Tab")
         time.sleep(0.2)
 
     _send_ssr_key(session.window_id, "Return")
-    record_file = _find_recorded_file(session)
+    record_file = session.record_file
+    if record_file is None:
+        record_file = _find_recorded_file(session)
+
+    record_file = _wait_for_record_file_stable(record_file)
     _close_screen_recording_app(session)
 
     if record_file is None:
@@ -975,6 +1097,9 @@ def run_all() -> int:
         else:
             logger.error(f"set channel to {c_n} failed")
             continue
+        logger.info(
+            f"===== Please refresh the browser in 1min, Start playing channel {c_n} after 1min. =====")
+        time.sleep(60)
         played_count = 0
         for lid in lidar_ids:
             files = grouped[lid]

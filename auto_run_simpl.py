@@ -62,6 +62,25 @@ SCREEN_RECORD_POLL_INTERVAL = float(
 SCREEN_RECORD_STABLE_ROUNDS = int(
     os.environ.get("SCREEN_RECORD_STABLE_ROUNDS", "3")
 )
+GNOME_STOP_RETRY_COUNT = int(os.environ.get("GNOME_STOP_RETRY_COUNT", "2"))
+GNOME_STOP_RECHECK_SECONDS = float(
+    os.environ.get("GNOME_STOP_RECHECK_SECONDS", "2.0")
+)
+GNOME_START_RETRY_COUNT = int(os.environ.get("GNOME_START_RETRY_COUNT", "3"))
+GNOME_STOP_RETRY_COUNT = int(os.environ.get("GNOME_STOP_RETRY_COUNT", "2"))
+GNOME_STATE_WAIT_TIMEOUT = float(
+    os.environ.get("GNOME_STATE_WAIT_TIMEOUT", "5"))
+GNOME_STATE_POLL_INTERVAL = float(
+    os.environ.get("GNOME_STATE_POLL_INTERVAL", "0.2"))
+GNOME_START_RETRY_COUNT = int(os.environ.get("GNOME_START_RETRY_COUNT", "3"))
+GNOME_STOP_RETRY_COUNT = int(os.environ.get("GNOME_STOP_RETRY_COUNT", "2"))
+GNOME_GROWTH_OBSERVE_SECONDS = float(
+    os.environ.get("GNOME_GROWTH_OBSERVE_SECONDS", "2.0")
+)
+GNOME_GROWTH_MIN_DELTA = int(os.environ.get("GNOME_GROWTH_MIN_DELTA", "1024"))
+GNOME_RECENT_FILE_WINDOW_SECONDS = float(
+    os.environ.get("GNOME_RECENT_FILE_WINDOW_SECONDS", "20.0")
+)
 
 
 @dataclass
@@ -447,7 +466,10 @@ def _get_gnome_screencast_shortcut() -> str:
             parsed = _parse_gnome_shortcut(binding)
             if parsed:
                 return parsed
-
+    logger.warning(
+        f"GNOME screencast shortcut is not set. "
+        "Enable it in Settings or set {GNOME_SCREEN_RECORD_TOGGLE_KEY}."
+    )
     return GNOME_DEFAULT_SCREENCAST_SHORTCUT
 
 
@@ -547,7 +569,7 @@ def ensure_screen_recording_ready(backend: str) -> None:
     logger.warning(
         "gnome-shortcut backend is toggle-based and cannot strictly guarantee "
         "that the exported video matches the interval between start_screen_recording() "
-        "and stop_screen_recording(). Recommend using --screen_record_backend ssr."
+        "and stop_screen_recording()."
     )
 
     if shutil.which("xdotool") is None:
@@ -696,9 +718,6 @@ def start_screen_recording(backend: str) -> ScreenRecordingSession:
     if backend == "gnome-shortcut":
         shortcut = _get_gnome_screencast_shortcut()
         candidate_dirs = _get_gnome_recording_candidate_dirs()
-        known_files = {
-            str(path) for path in _list_recording_candidates_in_dirs(candidate_dirs)
-        }
         restore_max_length = None
         max_length = _get_gnome_max_screencast_length()
         if (
@@ -720,11 +739,12 @@ def start_screen_recording(backend: str) -> ScreenRecordingSession:
                     "Temporarily set GNOME max screencast length to unlimited (was %ss).",
                     max_length,
                 )
-
-        started_at = time.time()
         try:
-            _toggle_gnome_screen_recording(shortcut)
-            time.sleep(1.0)
+            return _start_gnome_recording_with_retry_by_growth(
+                shortcut=shortcut,
+                candidate_dirs=candidate_dirs,
+                restore_max_length=restore_max_length,
+            )
         except Exception:
             if restore_max_length is not None:
                 try:
@@ -732,15 +752,6 @@ def start_screen_recording(backend: str) -> ScreenRecordingSession:
                 except RuntimeError as exc:
                     logger.warning("%s", exc)
             raise
-        logger.info("Screen recording started (GNOME toggle backend).")
-        return ScreenRecordingSession(
-            backend=backend,
-            known_files=known_files,
-            started_at=started_at,
-            candidate_dirs=candidate_dirs,
-            gnome_shortcut=shortcut,
-            restore_max_length=restore_max_length,
-        )
 
     output_template = get_ssr_output_template()
     if _is_ssr_running():
@@ -840,6 +851,187 @@ def _find_recorded_file(session: ScreenRecordingSession):
     )
 
 
+def _get_file_size(path: Path):
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return None
+
+
+def _is_file_growing(
+    path: Path,
+    observe_seconds: float = GNOME_GROWTH_OBSERVE_SECONDS,
+    poll_interval: float = SCREEN_RECORD_POLL_INTERVAL,
+    min_delta: int = GNOME_GROWTH_MIN_DELTA,
+) -> bool:
+    size0 = _get_file_size(path)
+    if size0 is None:
+        return False
+
+    deadline = time.time() + observe_seconds
+    max_size = size0
+
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+        size1 = _get_file_size(path)
+        if size1 is None:
+            return False
+        if size1 > max_size:
+            max_size = size1
+
+    return (max_size - size0) >= min_delta
+
+
+def _find_growing_gnome_record_file(
+    candidate_dirs: Tuple[Path, ...],
+    recent_window_seconds: float = GNOME_RECENT_FILE_WINDOW_SECONDS,
+):
+    now = time.time()
+    candidates = _list_recording_candidates_in_dirs(candidate_dirs)
+
+    # 先看最新的几个，避免全目录全量探测太慢
+    recent_candidates: list[Path] = []
+    for path in reversed(candidates):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        if now - stat.st_mtime <= recent_window_seconds:
+            recent_candidates.append(path)
+        if len(recent_candidates) >= 5:
+            break
+
+    for path in recent_candidates:
+        if _is_file_growing(path):
+            return path
+
+    return None
+
+
+def _ensure_no_active_gnome_recording_by_growth(
+    shortcut: str,
+    candidate_dirs: Tuple[Path, ...],
+    stop_retry_count: int = GNOME_STOP_RETRY_COUNT,
+) -> None:
+    for attempt in range(stop_retry_count + 1):
+        active_file = _find_growing_gnome_record_file(candidate_dirs)
+        if active_file is None:
+            logger.info(
+                "No active GNOME recording file detected before start.")
+            return
+
+        logger.warning(
+            "Detected active GNOME recording file before start, trying to stop it "
+            "(attempt %d/%d): %s",
+            attempt + 1,
+            stop_retry_count + 1,
+            active_file,
+        )
+
+        _toggle_gnome_screen_recording(shortcut)
+        time.sleep(0.5)
+
+        active_stopped = not _is_file_growing(active_file)
+        if active_stopped:
+            _wait_for_record_file_stable(
+                active_file, timeout=SSR_FILE_WAIT_SECONDS)
+            logger.info(
+                "Previous GNOME recording was stopped: %s", active_file)
+            return
+
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        f"Detected an active GNOME recording before start, but failed to stop it "
+        f"after {stop_retry_count + 1} attempts."
+    )
+
+
+def _start_gnome_recording_with_retry_by_growth(
+    shortcut: str,
+    candidate_dirs: Tuple[Path, ...],
+    restore_max_length: Optional[int] = None,
+) -> ScreenRecordingSession:
+    last_error = "unknown error"
+
+    for attempt in range(GNOME_START_RETRY_COUNT):
+        try:
+            # 1) 开始前先确保没有旧录制在继续
+            _ensure_no_active_gnome_recording_by_growth(
+                shortcut, candidate_dirs)
+
+            # 2) 记录当前文件集合
+            known_files = {
+                str(path) for path in _list_recording_candidates_in_dirs(candidate_dirs)
+            }
+
+            # 3) 发开始录制
+            started_at = time.time()
+            _toggle_gnome_screen_recording(shortcut)
+
+            # 4) 等待新的增长文件出现
+            record_file = _wait_for_active_recording_file(
+                known_files=known_files,
+                started_at=started_at,
+                list_candidates_fn=lambda: _list_recording_candidates_in_dirs(
+                    candidate_dirs),
+                timeout=SCREEN_RECORD_START_TIMEOUT,
+            )
+
+            if record_file is None:
+                last_error = (
+                    "GNOME start toggle was sent, but no actively growing file was detected."
+                )
+                logger.warning(
+                    "GNOME start attempt %d/%d failed: %s",
+                    attempt + 1,
+                    GNOME_START_RETRY_COUNT,
+                    last_error,
+                )
+                time.sleep(0.5)
+                continue
+
+            # 5) 再确认一次这个文件确实还在增长
+            if not _is_file_growing(record_file):
+                last_error = (
+                    f"Detected output file but it is not continuously growing: {record_file}"
+                )
+                logger.warning(
+                    "GNOME start attempt %d/%d failed: %s",
+                    attempt + 1,
+                    GNOME_START_RETRY_COUNT,
+                    last_error,
+                )
+                time.sleep(0.5)
+                continue
+
+            logger.info("Screen recording started (GNOME): %s", record_file)
+            return ScreenRecordingSession(
+                backend="gnome-shortcut",
+                known_files=known_files,
+                started_at=started_at,
+                candidate_dirs=candidate_dirs,
+                gnome_shortcut=shortcut,
+                restore_max_length=restore_max_length,
+                record_file=record_file,
+            )
+
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning(
+                "GNOME start attempt %d/%d raised an exception: %s",
+                attempt + 1,
+                GNOME_START_RETRY_COUNT,
+                exc,
+            )
+            time.sleep(0.5)
+
+    raise RuntimeError(
+        f"Failed to start GNOME screen recording after "
+        f"{GNOME_START_RETRY_COUNT} attempts: {last_error}"
+    )
+
+
 def _wait_for_active_recording_file(
     known_files: Set[str],
     started_at: float,
@@ -912,6 +1104,32 @@ def _wait_for_record_file_stable(
     return record_file if record_file.exists() else None
 
 
+def _is_record_file_still_growing(
+    record_file: Optional[Path] = None,
+    observe_seconds: float = 2.0,
+    poll_interval: float = SCREEN_RECORD_POLL_INTERVAL,
+) -> bool:
+    if record_file is None or not record_file.exists():
+        return False
+
+    try:
+        start_size = record_file.stat().st_size
+    except FileNotFoundError:
+        return False
+
+    deadline = time.time() + observe_seconds
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+        try:
+            current_size = record_file.stat().st_size
+        except FileNotFoundError:
+            return False
+        if current_size > start_size:
+            return True
+
+    return False
+
+
 def _close_screen_recording_app(session: ScreenRecordingSession) -> None:
     if session.process is None or session.window_id is None:
         return
@@ -932,12 +1150,32 @@ def stop_screen_recording(session: ScreenRecordingSession):
             raise RuntimeError(
                 "GNOME recording session does not have a shortcut configured."
             )
-        record_file = None
+        record_file = session.record_file
+        stop_succeeded = False
+        last_growth_detected = False
         try:
-            _toggle_gnome_screen_recording(session.gnome_shortcut)
-            time.sleep(1.0)
-            record_file = _find_recorded_file(session)
-            record_file = _wait_for_record_file_stable(record_file)
+            for attempt in range(GNOME_STOP_RETRY_COUNT + 1):
+                _toggle_gnome_screen_recording(session.gnome_shortcut)
+                time.sleep(1.0)
+                if record_file is None:
+                    record_file = _find_recorded_file(session)
+                record_file = _wait_for_record_file_stable(record_file)
+                still_growing = _is_record_file_still_growing(
+                    record_file,
+                    observe_seconds=GNOME_STOP_RECHECK_SECONDS,
+                )
+                last_growth_detected = still_growing
+                if not still_growing:
+                    stop_succeeded = True
+                    break
+                logger.warning(
+                    "GNOME recording file is still growing after stop toggle "
+                    "(attempt %d/%d): %s",
+                    attempt + 1,
+                    GNOME_STOP_RETRY_COUNT + 1,
+                    record_file,
+                )
+                time.sleep(1.0)
         finally:
             if session.restore_max_length is not None:
                 try:
@@ -953,8 +1191,15 @@ def stop_screen_recording(session: ScreenRecordingSession):
         if record_file is None:
             logger.warning(
                 "Screen recording finished, but no output file was detected.")
-        else:
-            logger.info("Screen recording saved to %s", record_file)
+            return None
+
+        if not stop_succeeded and last_growth_detected:
+            raise RuntimeError(
+                f"GNOME recording file is still growing after "
+                f"{GNOME_STOP_RETRY_COUNT + 1} stop toggle attempts: {record_file}"
+            )
+
+        logger.info("Screen recording saved to %s", record_file)
         return record_file
 
     if session.window_id is None:
@@ -1058,8 +1303,8 @@ def copy_recording_to_dir(record_file, target_dir):
 
 
 def run_all() -> int:
-    # args = _build_args()
-    args = parse_args()
+    args = _build_args()
+    # args = parse_args()
     lidar_ids = [x.strip() for x in args.lidar_ids.split(",") if x.strip()]
     keywords = [x.strip() for x in args.keywords.split(",") if x.strip()]
     simpl_channel = [x.strip() for x in args.items.split(",") if x.strip()]
@@ -1097,9 +1342,9 @@ def run_all() -> int:
         else:
             logger.error(f"set channel to {c_n} failed")
             continue
-        logger.info(
-            f"===== Please refresh the browser in 1min, Start playing channel {c_n} after 1min. =====")
-        time.sleep(60)
+        # logger.info(
+        #     f"===== Please refresh the browser in 1min, Start playing channel {c_n} after 1min. =====")
+        # time.sleep(60)
         played_count = 0
         for lid in lidar_ids:
             files = grouped[lid]

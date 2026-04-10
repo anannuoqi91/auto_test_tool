@@ -1,0 +1,11 @@
+certifi==2026.2.25
+cffi==1.17.1
+charset-normalizer==3.4.7
+cryptography==46.0.7
+idna==3.11
+pycparser==2.23
+PyYAML==6.0.3
+requests==2.32.4
+typing_extensions==4.13.2
+urllib3==2.2.3
+websockets==13.1
